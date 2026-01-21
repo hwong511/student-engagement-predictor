@@ -1,0 +1,799 @@
+---
+title: 'Caliper RQ'
+author: "Carnegie Learning Capstone Group"
+date: '`r lubridate::today()`'
+format: 
+  html: 
+    embed-resources: true
+    toc: true 
+    toc_depth: 4
+editor_options: 
+  chunk_output_type: console
+---
+
+## Setup
+
+```{r}
+#| warning: false
+
+library(dplyr)
+library(readr)
+library(skimr)
+library(tidyr)
+library(lme4)
+
+path_data <- "data"
+```
+
+## Loading in the data
+
+```{r}
+d <- read_csv(here::here(path_data, 'caliper-clean.csv')) %>%  janitor::clean_names()
+```
+
+```{r}
+d %>% skim()
+```
+
+## Basic Cleaning
+
+```{r}
+  d <- d %>%
+    filter(!is.na(stream_name), 
+           stream_name != "NA",                                    
+           !is.na(event_time),
+           !is.na(student_id_anon)
+           ) %>% 
+    mutate(event_time = as.POSIXct(event_time))
+```
+
+## Bruh
+
+Before we start, since `event_time` has a weird range (see below), we cannot calculate stream duration as first-to-last event across ALL students and ALL time periods - If the same stream was viewed in multiple class periods, the "duration" would span multiple days instead of actual class period duration. 
+
+```{r}
+min(d$event_time)
+max(d$event_time)
+```
+
+Consequently, we cannot calculate a student's time spent from first-to-last event across all class periods. Therefore, it's important to create a `class_period` column to indicate which class period the engagement belongs to.
+
+We can do this by making date-based class periods. I thought this was a bit sketchy but it seemed fine upon further examination - If Tyree was right in that this data was in UTC, then ~95.9% of events fall within normal school hours (10:00 EST - 16:00 EST) when interpreted as Eastern Time (UTC-4).
+
+Only 3.9% of events occur during late night/early morning, and could be due to 1) system timestamp errors, 2) students accessing content from home in evening, or 3) technical logging issues during timezone conversion. 
+
+Regardless, a date-based categorization for class periods is simple, robust, and captures ~96% of the events correctly while avoiding guesswork. So we will go with this for now until otherwise.
+
+```{r}
+d <- d %>% mutate(class_period = as.Date(event_time))
+```
+
+Now we can calculate STREAM characteristics (e.g. stream duration, # of assessments, # of videos, etc.) within each class period. This will be referred to as "stream-class". The columns I will be creating are:
+
+- `class_duration_minutes` = The span of the class session (from the first event to the last event) regardless of what happened in between.
+- `class_assessment_count` = # of unique assessments were attempted that class.
+- `class_video_count` = # of unique videos accessed that class.
+- `total_events` = Total number of raw events recorded (e.g. clicks, pauses, starts, assessment submissions) that stream-class.
+- `unique_students` = # of students active that stream-class.
+- `unique_timestamps` = # of unique timestamps that stream-class.
+
+
+**SACHI COMMENT** = Do we NEED to separate them by classes? Some events might start 05-02 11:59 PM right? Maybe we don't have to worry about this for now.
+Also, consider using visualizations to examine pausing behaviors and "class spans".
+
+DO IT WITHOUT SEPARATING INTO CLASSES AT THIS STEP! Try try.
+
+WAIT FOR SACHI REPLY.
+
+
+
+
+
+```{r}
+stream_class_characteristics <- d %>%
+  group_by(stream_name, class_period) %>%
+  summarise(
+    class_duration_minutes = as.numeric(difftime(max(event_time), min(event_time), units = "mins")),
+    class_assessment_count = n_distinct(assessment_id[!is.na(assessment_id) & assessment_id != "NA"]),
+    class_video_count = n_distinct(video_id[!is.na(video_id) & video_id != "NA"]),
+    total_events = n(),
+    unique_students = n_distinct(student_id_anon),
+    unique_timestamps = n_distinct(event_time),
+    .groups = 'drop'
+  ) %>%
+  # Filtering out low-quality stream-class combos
+  filter(total_events >= 3,
+         unique_students >= 1,
+         class_duration_minutes > 0,
+         unique_timestamps >= 2)
+```
+
+Upon further manual inspection, it looks like there are some "ANSWER_PASS", "Answer pass" and NA values. The answer-pass-es are `AssignableEvent` activities, likely system/administrative events. The NA values are `ToolLaunchEvent` activities, system events for launching/returning from MATHstream software. Therefore, I think it should be OK to remove them.
+
+```{r}
+stream_class_characteristics <- stream_class_characteristics %>% filter(!stream_name %in% c("ANSWER_PASS", "Answer Pass"),
+                                                                        !is.na(stream_name))
+```
+
+Now we can calculate stream-level characteristics across both class periods. The columns I will be creating are:
+
+- `stream_total_duration_minutes` = Total stream characteristics across all class periods.
+- `stream_total_assessments` = Total assessments across all class periods.
+- `stream_total_videos` = Total videos across all class periods
+- `stream_total_events` + `stream_unique_students` = Total events and students across all class periods
+- `class_periods_offered` = Class periods this stream appeared in
+
+```{r}
+stream_characteristics <- d %>%
+  inner_join(stream_class_characteristics %>% select(stream_name), by = "stream_name") %>%
+  group_by(stream_name) %>%
+  summarise(
+    stream_total_duration_minutes = as.numeric(difftime(max(event_time), min(event_time), units = "mins")), #FIX FIX FIX (Max event - min event leads to inflated measures)
+    stream_total_assessments = n_distinct(assessment_id[!is.na(assessment_id) & assessment_id != "NA"]),
+    stream_total_videos = n_distinct(video_id[!is.na(video_id) & video_id != "NA"]),
+    stream_total_events = n(),
+    stream_unique_students = n_distinct(student_id_anon),
+    class_periods_offered = n_distinct(class_period),
+    
+    .groups = 'drop'
+  ) %>%
+  # Filter out low-quality streams
+  filter(stream_total_events >= 10,             # Meaningful activity across all periods
+         stream_unique_students >= 2,           # Multiple students engaged
+         stream_total_duration_minutes > 5)     # At least 5 minutes total
+```
+
+OK now that we're done with that, we can make another dataset that looks at what happened across all STUDENTS in that class period.
+
+One mistake I made (and I'm now fixing) is to calculate engagement time like `last_event_time - first_event_time`. I realized that this led to super super low pause rate calculations, since I'm dividing amount of manual pauses by inflated time. I should instead measure only the time when the student was actually doing things.
+
+The approach I am taking is to identify separate learning sessions (when students take 10+ minute breaks), calculate time within each session separately, then add them up. While this approach is intuitive and handles long breaks naturally, it is a rather conservative approach and might underestimate engagement time rather than overestimate it.
+
+Lastly, while the 10-minute gap is pretty arbitrary, it should capture most real breaks while excluding brief pauses. Let me know if this is problematic though! 
+
+The columns I'm creating are:
+
+- `first_event` and `last_event` = First and last event time of a stream for a student.
+- `time_spent_minutes` = Active engagement time on a stream for a student (Imposes a minimum of 0.5 minutes if even if just one event, idk if this is problematic though).
+- `session_count` = # of distinct sessions (gaps >10 min = new session).
+- `assessments_attempted` = # of assessments completed by a student.
+- `student_total_events` = Raw # of events from a student.
+
+**SACHI COMMENT** = Explain this code. How is `time_spent_minutes` computed?
+
+The algorithm calculates how much time a student actively spent working on a stream during a specific class period, while excluding long breaks like lunch or time when they walked away from the computer.
+
+First, it takes all the events for ONE student in ONE stream on ONE date and sorts them chronologically. Then it looks at the time gaps between consecutive events. If the gap between two events is more than 10 minutes, the algorithm treats that as a break and splits the work into separate sessions. For example, if a student clicks at 10:00 AM, then again at 10:05 AM, then doesn't click again until 10:30 AM, the algorithm sees that 25-minute gap and says "they took a break." So it creates two sessions: one from 10:00 to 10:05, and another starting at 10:30.
+
+For each session, it calculates **the duration from the first event to the last event in that session**. So if a session has events at 10:00, 10:03, and 10:08, the session duration is 8 minutes. Then it adds up all the session durations to get the total active time.
+
+There's a special rule for single events or very short sessions: they get a minimum of 0.5 minutes. THIS IS COMPLETELY ARBITRARY THOUGH!!!!!!! But anyways, this prevents having zero duration when a student only clicks once, since even a single interaction should represent some engagement.
+
+The key benefit of this approach is that it excludes long breaks from the engagement time. If a student worked 10:00-10:30, took lunch from 10:30-12:00, then worked 12:00-12:45, the naive approach would say they were engaged for 2 hours and 45 minutes. But this algorithm correctly identifies the two work sessions and says they were engaged for only 1 hour and 15 minutes, excluding the lunch break. This gives you a much more accurate picture of actual learning time versus just having the system open.
+
+```{r}
+student_level_events <- d %>%
+    inner_join(stream_class_characteristics %>% select(stream_name, class_period), 
+               by = c("stream_name", "class_period")) %>%
+    group_by(student_id_anon, stream_name, class_period) %>%
+    summarise(
+      first_event = min(event_time),
+      last_event = max(event_time),
+      
+      # Function for calculating active engagement time while excluding long gaps
+      time_spent_minutes = {
+        times <- sort(event_time)
+        if(length(times) <= 1) {
+          0.5  # Minimum time for single event
+        } else {
+          gaps <- as.numeric(diff(times), units = "mins")
+          long_gaps <- gaps > 10  # 10+ minute gaps = session break
+          
+          if(any(long_gaps)) {
+            gap_positions <- which(long_gaps)
+            session_starts <- c(1, gap_positions + 1)
+            session_ends <- c(gap_positions, length(times))
+            
+            session_durations <- sapply(seq_along(session_starts), function(i) {
+              session_times <- times[session_starts[i]:session_ends[i]]
+              if(length(session_times) <= 1) {
+                0.5  # Minimum for single-event sessions
+              } else {
+                max(0.5, as.numeric(difftime(max(session_times), min(session_times), units = "mins")))
+              }
+            })
+            sum(session_durations)
+          } else {
+            max(0.5, as.numeric(difftime(max(times), min(times), units = "mins")))
+          }
+        }
+      },
+      
+      session_count = {
+        times <- sort(event_time)
+        if(length(times) <= 1) {
+          1
+        } else {
+          gaps <- as.numeric(diff(times), units = "mins")
+          sum(gaps > 10, na.rm = TRUE) + 1  # +1 for initial session
+        }
+      },
+      
+      assessments_attempted = n_distinct(assessment_id[!is.na(assessment_id) & assessment_id != "NA"]),
+      student_total_events = n(),
+      .groups = 'drop'
+    ) %>%
+    mutate(time_spent_minutes = pmax(time_spent_minutes, 0.5))
+```
+
+Now, we can make a dataset representing manual pause counts. This one is pretty intuitive so I'm not labeling what the columns mean.
+
+```{r}
+manual_pause_counts <- d %>%
+  inner_join(stream_class_characteristics %>% select(stream_name, class_period), 
+             by = c("stream_name", "class_period")) %>%
+  filter(event_type == "MediaEvent" &
+         object_type == "VideoObject" &
+          action == "Paused" &
+         pause_reason == "MANUAL") %>%
+  count(student_id_anon, stream_name, class_period, name = "total_pauses")
+```
+
+FINALLY, we can combine the tables, which should tell us what ONE STUDENT did in ONE stream-class period, along with some class-level info (e.g. how many assessments, how many video, etc.).
+
+```{r}
+student_stream_class_data <- student_level_events %>%
+  left_join(stream_characteristics, by = "stream_name") %>% 
+  left_join(stream_class_characteristics, by = c("stream_name", "class_period")) %>%
+  left_join(manual_pause_counts, by = c("student_id_anon", "stream_name", "class_period")) %>%
+  mutate(total_pauses = replace_na(total_pauses, 0))
+```
+
+```{r}
+cat("=== OUTLIER REMOVAL ===\n")
+cat("Original observations:", nrow(student_stream_class_data), "\n")
+
+# Identify extreme outliers (>150 min OR extreme pause patterns)
+outliers <- student_stream_class_data %>%
+  filter(time_spent_minutes > 150 | 
+         (time_spent_minutes > 100 & total_pauses == 0))
+
+cat("Outliers identified:", nrow(outliers), "\n")
+if(nrow(outliers) > 0) {
+  print(outliers %>% 
+        select(student_id_anon, stream_name, time_spent_minutes, 
+               total_pauses, student_total_events, session_count))
+}
+
+# Remove outliers
+student_stream_class_data <- student_stream_class_data %>%
+  filter(time_spent_minutes <= 150,
+         !(time_spent_minutes > 100 & total_pauses == 0))
+
+cat("Observations after outlier removal:", nrow(student_stream_class_data), "\n\n")
+```
+
+
+That being said, like Sachi mentioned, we need to do a stream-level normalization, since each stream has different length, different # of videos, and different difficulty. The columns I will be creating are:
+
+- `pause_rate_per_minute` = # of times per minute the student paused while actively engaged
+- `pause_rate_per_stream_assessment` = # of times per minute the student paused relative to the total number of assessments in the entire stream
+- `stream_progress_pct` = % of the total stream content the student experienced
+- `stream_completion_rate` = Proportion of the total stream's assessments the student completed
+- `stream_engagement_ratio` = Ratio of the total stream duration that the student was actively engaged
+- `event_rate_per_minute` = # of actions (clicks, interactions) the student performed per minute of engagement
+- `class_engagement_ratio` = Fraction of this specific class period the student was actively engaged
+- `class_completion_rate` = Proportion of this class period's assessments the student completed
+
+```{r}
+student_stream_class_normalized <- student_stream_class_data %>%
+  mutate(
+    pause_rate_per_minute = total_pauses / time_spent_minutes,
+    pause_rate_per_stream_assessment = total_pauses / stream_total_assessments,
+    stream_progress_pct = (time_spent_minutes / stream_total_duration_minutes) * 100,
+    stream_completion_rate = assessments_attempted / stream_total_assessments,
+    stream_engagement_ratio = pmin(time_spent_minutes / class_duration_minutes, 1.0), # Engagement relative to class period
+    event_rate_per_minute = student_total_events / time_spent_minutes,
+    class_engagement_ratio = time_spent_minutes / class_duration_minutes,
+    class_completion_rate = ifelse(class_assessment_count > 0, 
+                                 assessments_attempted / class_assessment_count, 0)
+  )
+```
+
+We can go one level deeper, and look at student baselines/averages. The new columns are:
+
+- `avg_pause_rate_per_minute` = Student's average pause rate across all engagements.
+- `avg_stream_engagement_ratio` = Student's average stream engagement ratio.
+- `avg_event_rate_per_minute` = Student's average event rate.
+- `avg_stream_progress_pct` = Student's average stream progress %.
+- `total_class_periods` = # of class periods this student attended..
+
+```{r}
+student_baselines <- student_stream_class_normalized %>%
+  group_by(student_id_anon) %>%
+  summarise(
+    avg_pause_rate_per_minute = mean(pause_rate_per_minute, na.rm = TRUE),
+    avg_stream_engagement_ratio = mean(stream_engagement_ratio, na.rm = TRUE),
+    avg_event_rate_per_minute = mean(event_rate_per_minute, na.rm = TRUE),
+    avg_stream_progress_pct = mean(stream_progress_pct, na.rm = TRUE),
+    total_class_periods = n(),
+    .groups = 'drop'
+  )
+```
+
+FINALLY, we can make the final dataset. The new columns are:
+
+- `relative_pause_rate` = Student's average pause rate (individually-adjusted).
+- `relative_stream_engagement` = Student's average engagement (same).
+- `relative_event_rate` = Student's average event rate (same).
+- `class_period_number` = Sequential number of class period for this student (1, 2, ...)
+- `is_first_class` + `is_last_class` = Whether it's student's first or repeated encounter with this stream.
+- `student_total_periods` = # of class periods this student attended.
+
+```{r}
+data <- student_stream_class_normalized %>%
+  left_join(student_baselines, by = "student_id_anon") %>%
+  group_by(student_id_anon) %>%
+  arrange(class_period) %>%
+  mutate(
+    relative_pause_rate = ifelse(avg_pause_rate_per_minute > 0,
+                               pause_rate_per_minute / avg_pause_rate_per_minute, 0),
+    relative_stream_engagement = ifelse(avg_stream_engagement_ratio > 0,
+                                      stream_engagement_ratio / avg_stream_engagement_ratio, 0),
+    relative_event_rate = ifelse(avg_event_rate_per_minute > 0,
+                               event_rate_per_minute / avg_event_rate_per_minute, 0),
+    class_period_number = dense_rank(class_period),
+    is_first_class = class_period == min(class_period),
+    is_later_class = class_period > min(class_period),
+    student_total_periods = n_distinct(class_period)
+  ) %>%
+  ungroup() %>%
+  # Filter to engaged observations
+  filter(time_spent_minutes > 1,           
+         !is.na(stream_name),              
+         stream_name != "NA",              
+         stream_total_duration_minutes > 0) %>%
+  select(
+    student_id = student_id_anon,
+    stream_name,
+    class_period,
+    total_pauses,
+    time_spent_minutes,
+    session_count,
+    assessments_attempted,
+    student_total_events,
+    stream_total_duration_minutes,
+    stream_total_assessments,
+    stream_total_videos,
+    stream_total_events,
+    class_duration_minutes,
+    class_assessment_count,
+    class_video_count,
+    total_events,
+    pause_rate_per_minute,
+    pause_rate_per_stream_assessment,
+    stream_progress_pct,
+    stream_engagement_ratio,
+    stream_completion_rate,
+    event_rate_per_minute,
+    class_engagement_ratio,
+    class_completion_rate,
+    relative_pause_rate,
+    relative_stream_engagement,
+    relative_event_rate,
+    class_period_number,
+    is_first_class,
+    is_later_class,
+    student_total_periods
+  ) %>%
+  # Rounding
+  mutate(
+    across(c(time_spent_minutes, stream_total_duration_minutes, class_duration_minutes), ~ round(.x, 2)),
+    across(c(pause_rate_per_minute, event_rate_per_minute), ~ round(.x, 4)),
+    across(c(pause_rate_per_stream_assessment, stream_progress_pct, stream_engagement_ratio, 
+             stream_completion_rate, class_engagement_ratio, class_completion_rate,
+             relative_pause_rate, relative_stream_engagement, relative_event_rate), ~ round(.x, 3))
+  )
+```
+
+## RQ1. What factors predict student progress through learning content?
+
+```{r}
+m1 <- lm(stream_progress_pct ~ pause_rate_per_minute + session_count + 
+                  is_later_class, data=data)
+summary(m1)
+```
+
+This model showed that traditional engagement metrics such as pause rate and # of sessions students attended actually have pretty limited predictive power ($R^2$ = 0.026). Nonetheless, we found that students during later class exposures has 4.26% less stream progress compared to their counterparts in their first encounter (b = -4.26, p < .05). However, neither pause rate per minute (b = 5.95, p = 0.279) nor session count (b = 0.25, p = 0.770) significantly predict how much of a stream students will complete. 
+
+This suggests that raw pausing frequency and session fragmentation are not straightforward indicators of learning progress, which is messed up.
+
+## RQ2. How does pausing behavior relate to content density and student performance?
+
+```{r}
+m2 <- lm(pause_rate_per_stream_assessment ~ stream_progress_pct + 
+                 stream_completion_rate + relative_pause_rate,
+                 data=data)
+summary(m2)
+```
+
+```{r}
+m2c <- lm(relative_pause_rate ~ 
+          relative_stream_engagement +  # Both normalized to student baseline
+          stream_completion_rate +      
+          is_later_class,
+          data = data)
+
+summary(m2c)
+```
+
+```{r}
+data_matched <- data %>% 
+  filter(time_spent_minutes >= 10, time_spent_minutes <= 30)
+
+summary(lm(total_pauses ~ stream_completion_rate, data = data_matched))
+
+summary(lm(total_pauses ~ stream_progress_pct + stream_completion_rate + time_spent_minutes, data = data))
+```
+
+```{r}
+# Create achievement categories for visualization
+data_viz <- data %>%
+  mutate(
+    achievement_level = case_when(
+      stream_completion_rate < 0.33 ~ "< 33%",
+      stream_completion_rate < 0.67 ~ "33-67%",
+      TRUE ~ "> 67%"
+    ),
+    achievement_level = factor(achievement_level, 
+                              levels = c("< 33%",
+                                       "33-67%",
+                                       "> 67%"))
+  )
+
+# Create the plot
+ggplot(data_viz, aes(x = time_spent_minutes, y = total_pauses)) +
+  geom_point(aes(color = achievement_level), alpha = 0.5, size = 2) +
+  geom_smooth(method = "lm", color = "black", linewidth = 1.2, se = TRUE) +
+  scale_color_manual(values = c("red", "yellow", "green"),
+                     name = "Stream Completion Rate") +
+  labs(
+    title = "Manual Pausing Is Driven By Content Exposure, Not Achievement",
+    x = "Time Spent on Stream (minutes)",
+    y = "Total Manual Pauses",
+    caption = "Note: The single regression line indicates pausing scales with time spent regardless of achievement level.\nHigh and low achievers with similar exposure pause similarly."
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "gray30", size = 11),
+    legend.position = "right",
+    panel.grid.minor = element_blank(),
+    plot.caption = element_text(hjust = 0, color = "gray50", size = 9)
+  ) +
+  coord_cartesian(xlim = c(0, max(data_viz$time_spent_minutes) * 1.05))
+```
+
+
+
+This model was heat, as the results showed that students who made more progress through the stream paused significantly more relative to the # of assessments available in the entire stream (b = 0.0026, p < .001). This suggests that more pauses represents active engagement rather than boredom/disengagement.
+
+Additionally, the results showed that students who finished more of the total stream's assessments had paused significantly more relative to the # of assessments available in the stream (b = 0.435, p < .001). Adding to the finding stated above, this suggests that pausing behavior scales with academic productivity.
+
+Lastly, to no one's surprise, students with higher individual pause tendency also paused significantly more (b = 0.026, p < .001). Still, this suggests that students can maintain consistent self-regulation pattern.
+
+## RQ3. How do individual differences and stream characteristics affect the relationship between pausing and learning progress?
+
+```{r}
+m3 <- lmer(stream_progress_pct ~ pause_rate_per_minute + 
+                       is_later_class + relative_stream_engagement +
+                       (1 | student_id) + (1 | stream_name),
+                       data=data)
+summary(m3)
+```
+
+This model showed that both student random effects/learner characteristics (SD = 8.63) and stream random effects/stream content (SD = 14.58) significantly influences outcomes. Additionally, the results showed that students who engaged more with stream content (relative to their baseline) made more progress through the stream (b = 1.78, t = 8.827).
+
+However, we also see that pause rate per minute, while controlling for student-level and stream-level random effects, becomes non-significant (b = -1.04, t = -0.991). This suggests that absolute pausing behavior matters less than individualized engagement patterns.
+
+## RQ4. How does pausing behavior change as students gain experience with content and over time?
+
+```{r}
+m4 <- lm(pause_rate_per_minute ~ stream_progress_pct + is_later_class + stream_completion_rate,
+                  data=data)
+summary(m4)
+```
+
+PAIN.
+
+This model showed that stream progress (b = 0.0006, p = 0.311), later class exposure (b = 0.008, p = 0.612), and stream completion rate (b = 0.014, p = 0.899) ALL fail to significantly predict pausing behavior per minute. The overall-non-significant model suggests that temporal patterns in pause frequency operate independently of content progress and familiarity variables, indicating that momentary pausing decisions may be driven by factors not captured in these stream-level metrics.
+
+## RQ5. What drives individual differences in self-regulation behaviors (relative to each student's baseline)?
+
+```{r}
+m5 <- lmer(pause_rate_per_minute ~ stream_progress_pct + stream_completion_rate +
+                      (1 | student_id),
+                      data=data)
+summary(m5)
+```
+
+PAIN!
+
+This model showed that neither stream progress (b = 0.0005, t = 0.822) nor stream completion rate (b = -0.002, t = -0.018) significantly predict raw pause rates per minute when accounting for student-level random effects (in other words, individual differences). This suggests that pause rate operates independently from content-level achievement metrics. In other words, students’ pausing behaviors don’t seem to depend on their progress in the stream. Instead, it probably "just happens" in the moment, when the material feels confusing, heavy, or requires extra thought — not because of their overall progress or performance. I guess that makes sense.
+
+## VISUALIZATION
+
+```{r}
+library(ggplot2)
+library(dplyr)
+```
+
+### Distribution of key metrics
+
+```{r}
+# Pause Rate Distribution
+
+ggplot(data, aes(x = pause_rate_per_minute)) +
+  geom_histogram(bins = 50, fill = "blue", alpha = 0.7) +
+  geom_vline(xintercept = median(data$pause_rate_per_minute, na.rm = TRUE),
+             color = "red", linetype = "dashed", linewidth = 0.5) +
+  labs(title = "Distribution of Pause Rates",
+       subtitle = "Red line = median",
+       x = "Pauses per Minute",
+       y = "Count")
+```
+
+```{r}
+# Time spent distribution
+
+ggplot(data, aes(x = time_spent_minutes)) +
+  geom_histogram(bins = 50, fill = "blue", alpha = 0.7) +
+  scale_x_log10() +
+  labs(title = "Distribution of Time Spent (log scale)",
+       x = "Minutes (log scale)",
+       y = "Count")
+```
+
+```{r}
+# Session count distribution
+
+ggplot(data, aes(x = factor(session_count))) +
+  geom_bar(fill = "blue", alpha = 0.7) +
+  labs(title = "Session Fragmentation",
+       subtitle = "How many sessions per student-stream-class?",
+       x = "Number of Sessions",
+       y = "Count")
+```
+
+### Pause behavior vs. Engagement
+
+```{r}
+# Pause rate vs. time spent
+
+ggplot(data, aes(x = time_spent_minutes, y = pause_rate_per_minute)) +
+  geom_point(alpha = 0.3, color = "blue") +
+  geom_smooth(method = "loess", color = "red", se = TRUE) +
+  scale_x_log10() +
+  labs(title = "Pause Rate vs Time Spent",
+       subtitle = "Do students who spend more time pause more?",
+       x = "Time Spent (minutes, log scale)",
+       y = "Pause Rate (pauses/minute)")
+```
+
+```{r}
+# Pause rate vs. stream progress
+
+ggplot(data, aes(x = stream_progress_pct, y = pause_rate_per_minute)) +
+  geom_point(alpha = 0.3, color = "blue") +
+  geom_smooth(method = "loess", color = "red", se = TRUE) +
+  labs(title = "Pause Rate vs Stream Progress",
+       subtitle = "Do students who make more progress pause differently?",
+       x = "Stream Progress (%)",
+       y = "Pause Rate (pauses/minute)")
+```
+
+```{r}
+# Pause rate vs. completion rate
+
+ggplot(data, aes(x = stream_completion_rate, y = pause_rate_per_minute)) +
+  geom_point(alpha = 0.3, color = "blue") +
+  geom_smooth(method = "loess", color = "red", se = TRUE) +
+  labs(title = "Pause Rate vs Stream Completion Rate",
+       subtitle = "Do students who complete more assessments pause more?",
+       x = "Stream Completion Rate (proportion)",
+       y = "Pause Rate (pauses/minute)")
+```
+
+### Individual differences
+
+bluh blhu
+
+### Temporal patterns
+
+```{r}
+ggplot(data, aes(x = is_first_class, y = pause_rate_per_minute, fill = is_first_class)) +
+  geom_boxplot() +
+  labs(title = "Pause Rate: First Class vs Later Classes",
+       subtitle = "Do students pause differently in their first exposure?",
+       x = "First Class?",
+       y = "Pause Rate (pauses/minute)")
+```
+
+```{r}
+ggplot(data %>% filter(student_total_periods >= 3),
+       aes(x = class_period_number, y = stream_progress_pct)) +
+  geom_point(alpha = 0.2, color = "steelblue") +
+  geom_smooth(method = "lm", color = "red", se = TRUE) +
+  labs(title = "Stream Progress vs Class Period Number",
+       subtitle = "Do students make more progress in later sessions?",
+       x = "Class Period Number (1 = first, 2 = second, etc.)",
+       y = "Stream Progress (%)")
+```
+
+### Stream-level diff
+
+```{r}
+# Pause rate by stream
+
+top_streams <- data %>%
+  count(stream_name, sort = TRUE) %>%
+  head(10) %>%
+  pull(stream_name)
+
+data %>%
+  filter(stream_name %in% top_streams) %>%
+  ggplot(aes(x = reorder(stream_name, pause_rate_per_minute, FUN = median),
+             y = pause_rate_per_minute)) +
+  geom_boxplot(fill = "blue", alpha = 0.7) + 
+  coord_flip() +
+  labs(title = "Pause Rate by Stream (Top 10 Streams)",
+       subtitle = "Do some streams elicit more pausing?",
+       x = "Stream Name",
+       y = "Pause Rate (pauses/minute)")
+```
+
+```{r}
+# completion rate vs pause rate
+
+stream_summary <- data %>%
+  group_by(stream_name) %>%
+  summarise(
+    avg_pause_rate = mean(pause_rate_per_minute, na.rm = TRUE),
+    avg_completion = mean(stream_completion_rate, na.rm = TRUE),
+    n_students = n_distinct(student_id)
+  ) %>%
+  filter(n_students >= 5)  # Only streams with 5+ students
+
+ggplot(stream_summary, aes(x = avg_completion, y = avg_pause_rate, size = n_students)) +
+  geom_point(alpha = 0.6, color = "blue") +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  labs(title = "Stream Difficulty Patterns",
+       subtitle = "Streams with lower completion rates (harder?) show different pause patterns",
+       x = "Average Stream Completion Rate",
+       y = "Average Pause Rate (pauses/minute)",
+       size = "Number of\nStudents")
+```
+
+### Session fragmentation patterns
+
+```{r}
+
+```
+
+### Assessment completion patterns
+
+```{r}
+# Assessment attempted vs. time spent (This one is obvious)
+
+ggplot(data, aes(x = assessments_attempted, y = time_spent_minutes)) +
+  geom_point(alpha = 0.3, color = "blue") +
+  geom_smooth(method = "lm", color = "red", se = TRUE) +
+  scale_y_log10() +
+  labs(title = "Assessments Attempted vs Time Spent",
+       x = "Number of Assessments Attempted",
+       y = "Time Spent (minutes, log scale)")
+```
+
+```{r}
+# Event rate
+
+ggplot(data, aes(x = event_rate_per_minute)) +
+  geom_histogram(bins = 50, fill = "blue", alpha = 0.7) +
+  geom_vline(xintercept = median(data$event_rate_per_minute, na.rm = TRUE),
+             color = "red", linetype = "dashed") +
+  labs(title = "Distribution of Event Rates",
+       subtitle = "How many actions per minute? Red line = median",
+       x = "Events per Minute",
+       y = "Count")
+```
+
+### Corr
+
+```{r}
+library(corrplot)
+
+cor_vars <- data %>%
+  select(pause_rate_per_minute, time_spent_minutes, session_count,
+         stream_progress_pct, stream_completion_rate, event_rate_per_minute,
+         class_engagement_ratio, assessments_attempted) %>%
+  na.omit()
+
+cor_matrix <- cor(cor_vars)
+
+corrplot(cor_matrix, method = "color", type = "upper",
+         tl.col = "black", tl.srt = 45,
+         title = "Correlation Heatmap of Key Metrics",
+         addCoef.col = "black",
+         number.cex = 0.4)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+# Find this outlier
+data %>% 
+  filter(time_spent_minutes > 150) %>%
+  select(student_id, stream_name, time_spent_minutes, total_pauses, 
+         student_total_events, session_count)
+```
+
+```{r}
+# Original model
+summary(lm(total_pauses ~ stream_progress_pct + stream_completion_rate + 
+           time_spent_minutes, data = data))
+
+# Without outlier
+data_cleaned <- data %>% filter(time_spent_minutes <= 150)
+summary(lm(total_pauses ~ stream_progress_pct + stream_completion_rate + 
+           time_spent_minutes, data = data_cleaned))
+```
+
+```{r}
+# Remake the plot without the outlier
+data_cleaned <- data_viz %>% filter(time_spent_minutes <= 150)
+
+ggplot(data_cleaned, aes(x = time_spent_minutes, y = total_pauses)) +
+  geom_point(aes(color = achievement_level), alpha = 0.5, size = 2) +
+  geom_smooth(method = "lm", color = "black", linewidth = 1.2, se = TRUE) +
+  scale_color_manual(values = c("#d73027", "#fee08b", "#1a9850"),
+                     name = "Achievement Level") +
+  labs(
+    title = "Manual Pausing Is Driven By Content Exposure, Not Achievement",
+    subtitle = "All achievement levels follow the same pause-time relationship",
+    x = "Time Spent on Stream (minutes)",
+    y = "Total Manual Pauses",
+    caption = "Note: One extreme outlier (208 min, 0 pauses) excluded.\nThe relationship between time and pausing is consistent across achievement levels."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "gray30", size = 11),
+    legend.position = "right",
+    panel.grid.minor = element_blank(),
+    plot.caption = element_text(hjust = 0, color = "gray50", size = 9)
+  )
+```
+

@@ -1,0 +1,194 @@
+---
+title: 'Data Cleaning Notebook'
+author: "Ho Wong"
+date: '`r lubridate::today()`'
+format: 
+  html: 
+    embed-resources: true
+    toc: true 
+    toc_depth: 4
+editor_options: 
+  chunk_output_type: console
+---
+
+## Setup
+
+```{r}
+#| warning: false
+library(skimr)
+library(readxl)
+library(tidyverse)
+library(tidymodels)
+
+path_data <- "data"
+```
+
+## Data Cleaning - BROMP
+
+### Loading Data
+
+```{r}
+d <- read_excel(here::here(path_data, 'BROMP_sorted_by_studentid.xlsx')) %>% janitor::clean_names()
+
+d %>% skim()
+```
+
+### Re-classing the Variables
+
+```{r}
+sapply(d, class)
+```
+
+```{r}
+options(digits.secs = 3) 
+
+d <- d %>% mutate(ntp_time = lubridate::mdy_hms(ntp_time, tz="America/New_York"),
+                  ntp_time = ntp_time + lubridate::milliseconds(msoffsetfromstart),
+                  behavior = as.factor(behavior),
+                  affect = as.factor(affect))
+
+d <- d %>% select(-c(ntp_time_ms, notes)) # Removing now redundant columns
+```
+
+```{r}
+sapply(d, class)
+```
+
+### Missingness Diagnostics
+
+```{r}
+naniar::vis_miss(d)
+naniar::miss_var_summary(d)
+```
+
+Looks like we're not missing much except 2 rows. Upon further manual inspection, we can see that it seems to just be two students, who are responsible for the missing values. It should be safe to remove these students and consider them as invalid observations.
+
+### Handling Missing Data
+
+```{r}
+d <- d %>% tidyr::drop_na()
+
+d %>% skim()
+```
+
+Looks good.
+
+### Further Cleaning
+
+While inspecting `skim(d)`, I noticed that we have 308 "skipped" values in the `behavior` column. The data dictionary states that some possible reasons for "skipped" include:
+
+- student was out of their seat / out of the room
+- student noticed the observer and was looking at them
+- student was entered erroneously at the start of the observation
+
+Essentially, it's safe to consider rows with "skipped" to be invalid observations, and is therefore safe to remove.
+
+```{r}
+d <- d %>% filter(behavior != "skipped")
+d <- d %>% mutate(behavior = droplevels(behavior))
+unique(d$behavior)
+```
+
+The following code chunk removes the 5 instances of "$" in `behavior` and the 5 instance of "?" in `affect`, and can be removed later if we have extra information.
+
+```{r}
+# REMOVING $ IN BEHAVIOR COLUMN, DELETE IF WE HAVE EXTRA INFO LATER!
+
+d <- d %>% filter(behavior != "$")
+d <- d %>% mutate(behavior = droplevels(behavior))
+unique(d$behavior)
+
+# REMOVING ? IN AFFECT COLUMN, DELETE IF WE HAVE EXTRA INFO LATER!
+d <- d %>% filter(affect != "?")
+d <- d %>% mutate(affect = droplevels(affect))
+unique(d$affect)
+```
+
+```{r}
+write_csv(d, file.path(path_data, "BROMP-clean.csv"))
+```
+
+
+## Data Cleaning - Caliper
+
+### Loading Data
+
+```{r}
+d <- read_excel(here::here(path_data, 'caliper-bromp-data-2.xlsx')) %>% janitor::clean_names()
+
+d %>% skim()
+```
+
+### Re-classing the Variables
+
+```{r}
+sapply(d, class)
+```
+
+```{r}
+d <- d %>% mutate(event_time = lubridate::ymd_hms(event_time, tz="UTC"),
+                  event_type = as.factor(event_type),
+                  object_type = as.factor(object_type),
+                  action = as.factor(action),
+                  stream_name = as.factor(stream_name),
+                  pause_reason = as.factor(pause_reason))
+
+d <- d %>% mutate(action = fct_relevel(action, "Started", "Resumed", "Paused", "Completed", "Ended")) 
+# ^ I did this to turn `action` into ordinal... If it's not necessary or complicates stuff, we can get rid of this later.
+```
+
+```{r}
+sapply(d, class)
+```
+
+### Missingness Diagnostics
+
+```{r}
+naniar::vis_miss(d)
+naniar::miss_var_summary(d)
+```
+
+We have missing data in:
+
+- `pause_reason`: ~85.6% of the dataset. Since a pause reason should be present for each paused event, and we have 2883 paused event but only 2215 pause reasons, 668 of these missing entries are unexpected and requires further missingness diagnostics.
+- `current_time` = ~78.8% of the dataset. This is expected to be only present for Paused / Resumed events and is therefore Missing by Design.
+- `question_id`: ~66.5% of the dataset. This is expected for non-assessment events and is therefore Missing by Design.
+- `assessment_id`: ~53.3% of the dataset. This is expected for non-assessment events and is therefore Missing by Design.
+- `video_id`: ~52.6% of the dataset. Since we should have a video ID for each `MediaEvent`, and we have XXXX MediaEvents but only XXXX video IDs, 2285 of these missing entries are unexpected and requires further missingness diagnostics.
+- `federated_session id`: ~48.6% of the dataset. "Lots of missing data here" in the original dataset notes. Potential column to be dropped.
+- `attempt_id` ~18.5% of the dataset. Lots of "Missing" and "NA" on top of all the already missing data. Potential column to be dropped.
+- `object_id_clean`: ~0.97% of the dataset. Since every event should act on some object, we should expect this column to have no missing data. This requires further missingness diagnostics.
+- `stream_id` = ~0.03% of the dataset. Since we should have a stream ID for each stream, and we have 26 unique streams but only 24 unique stream IDs (with 5 missing stream IDs), at least 3 of these missing entries are unexpected and requires further missingness diagnostics.
+
+### Handling Missing Data (suggestions)
+
+For `pause_reason`, we can handle the missing values by categorizing them manually. That is, different types of content get paused for different reasons. For instance, we can impute the missing values based on the knowledge that videos are usually paused manually, while lessons might be paused because an assessment started. Apart from this, we can look at what happens immediately AFTER a pause to infer WHY it was paused. For instance, if someone pauses and then opens an assessment, they probably paused because the assessment started.
+
+For `video_id`, we can handle the missing values by mapping it with the relevant `stream_id`. That is, if we know Stream A always contains Video A, we can fill in missing video IDs for events in Stream A. That being said, since not all events should have video IDs, maybe we can categorize WHY the video-id is missing - Instead of treating all missing values the same, we can distinguish between "should have but missing" vs "legitimately doesn't need one".
+
+For `object_id_clean`, we can handle the missing values by looking at other ID columns in the same row to "guess" what the missing `object-id-clean` should be. For instance, if someone is interacting with an Assessment object, the `object-id-clean` should probably be the `assessment-id`. Apart from this, we can also look at other events in the same user session to see what objects they were working with - If 10 events in a session have object-id-clean="ABC123" and 2 events are missing it, those 2 probably also refer to "ABC123".
+
+For `stream_id`, we can handle the missing values by first creating new stream IDs for the 2 unmapped stream names that currently lack corresponding IDs - this addresses the referential integrity issue between stream names and stream IDs. For the remaining 5 individual missing records, we can use temporal context by looking at the student's activity sequence around the missing records and applying the "active stream" from immediately before or after the gap. Apart from this, we can also consolidate similar streams if the unmapped stream names are variants of existing ones (e.g., mapping "Advanced Fractions" to the existing "Fractions" `stream_id`), or alternatively create a stream hierarchy where unmapped streams become sub-streams of their closest parent stream while preserving the original granularity for detailed analysis.
+
+### Validating Data
+
+```{r}
+sum(!grepl("^urn:uuid:[0-9a-f-]{36}$", d$caliper_event_id)) # caliper_event_id 👍
+sum(nchar(d$student_id_anon) != 16 | !grepl("^stu_", d$student_id_anon)) # student_id 👍
+sum(d$object_type == "VideoObject" & is.na(d$video_id), na.rm=T) # video_id 🆖
+sum(d$object_type == "Assessment" & is.na(d$assessment_id), na.rm=T) # assessment_id 👍
+sum(d$action == "Paused" & is.na(d$pause_reason), na.rm=T) # pause_reason 🆖
+sum(d$current_time < 0 | d$current_time > 10000, na.rm=T) # current_time 👍
+```
+
+```{r}
+# Duplicate detection
+
+sum(duplicated(d$caliper_event_id))
+
+d <- d %>% distinct(caliper_event_id, .keep_all = TRUE) # Dropping them... These rows are exact duplicates of one another...
+```
+
+```{r}
+write_csv(d, file.path(path_data, "caliper-clean.csv"))
+```
