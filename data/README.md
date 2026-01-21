@@ -74,11 +74,11 @@ This project uses proprietary educational data that **cannot be shared publicly*
 
 All data has been de-identified following best practices:
 
-- ✅ Student IDs replaced with anonymous codes
-- ✅ No personally identifiable information (PII)
-- ✅ Classroom identifiers anonymized
-- ✅ Temporal patterns preserved for analysis
-- ✅ Geographic information removed
+- Student IDs replaced with anonymous codes
+- No personally identifiable information (PII)
+- Classroom identifiers anonymized
+- Temporal patterns preserved for analysis
+- Geographic information removed
 
 ### Ethical Use
 
