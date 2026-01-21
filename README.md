@@ -264,6 +264,6 @@ The data files (`BROMP-clean.csv`, `caliper-bromp-data-2.xlsx`, etc.) are subjec
 ## Contact
 
 **Ho Wong**  
-EMAIL: [howong112@outlook.com]  
-LINKEDIN: [http://linkedin.com/in/hwong511]  
-PORTFOLIO: [http://hwong511.github.io]
+**Email:** howong112@outlook.com
+**LinkedIn:** http://linkedin.com/in/hwong511
+**Portfolio:** http://hwong511.github.io
